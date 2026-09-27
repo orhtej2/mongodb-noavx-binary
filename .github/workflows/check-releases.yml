@@ -1,0 +1,23 @@
+name: Check MongoDB releases
+
+on:
+  schedule:
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out release checker
+        uses: actions/checkout@v4
+
+      - name: Dispatch builds for unpublished major releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: bash scripts/check-releases.sh

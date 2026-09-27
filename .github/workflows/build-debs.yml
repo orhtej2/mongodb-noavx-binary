@@ -1,0 +1,82 @@
+name: Build MongoDB DEBs
+
+on:
+  workflow_dispatch:
+    inputs:
+      mongo_version:
+        description: Stable MongoDB release tag version, without the r prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mongodb-debs-${{ inputs.mongo_version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.suite }} ${{ matrix.arch }} DEB
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: bookworm
+            arch: amd64
+            runner: ubuntu-22.04
+          - suite: trixie
+            arch: amd64
+            runner: ubuntu-24.04
+          - suite: bookworm
+            arch: arm64
+            runner: ubuntu-22.04-arm
+          - suite: trixie
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out packaging configuration
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: sudo bash scripts/mongodb-debs.sh install-deps
+
+      - name: Build and test package
+        env:
+          MONGO_VERSION: ${{ inputs.mongo_version }}
+          DEBIAN_SUITE: ${{ matrix.suite }}
+          DEBIAN_ARCH: ${{ matrix.arch }}
+        run: bash scripts/mongodb-debs.sh build "$MONGO_VERSION" "$DEBIAN_SUITE" "$DEBIAN_ARCH"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.suite }}-${{ matrix.arch }}-${{ inputs.mongo_version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish versioned release
+    needs: build
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+    steps:
+      - name: Check out packaging configuration
+        uses: actions/checkout@v4
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*-${{ inputs.mongo_version }}
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MONGO_VERSION: ${{ inputs.mongo_version }}
+        run: bash scripts/mongodb-debs.sh publish "$MONGO_VERSION" dist
