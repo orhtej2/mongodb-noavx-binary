@@ -7,6 +7,8 @@ SUITES=(bookworm trixie)
 ARCHITECTURES=(amd64 arm64)
 BUILD_JOBS="${BUILD_JOBS:-2}"
 WORK_DIR=""
+CACHE_TMP=""
+SOURCE_CACHE_DIR="${MONGODB_SOURCE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/mongodb-baseline/sources}"
 export CI=1
 export DEBIAN_FRONTEND=noninteractive
 export GIT_TERMINAL_PROMPT=0
@@ -15,6 +17,9 @@ export PIP_NO_INPUT=1
 cleanup() {
     if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
         rm -rf -- "$WORK_DIR"
+    fi
+    if [[ -n "$CACHE_TMP" && -f "$CACHE_TMP" ]]; then
+        rm -f -- "$CACHE_TMP"
     fi
 }
 trap cleanup EXIT
@@ -67,7 +72,7 @@ install_deps() {
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
         build-essential ca-certificates curl dpkg-dev fakeroot git lld \
-        patch pkg-config debhelper libcurl4-openssl-dev liblzma-dev libssl-dev \
+        libncurses6 patch pkg-config debhelper libcurl4-openssl-dev liblzma-dev libssl-dev \
         libzstd-dev python3 python3-dev python3-pip python3-venv qemu-user
 }
 
@@ -150,11 +155,21 @@ build_one() {
     WORK_DIR="$(mktemp -d)"
     source_dir="$WORK_DIR/mongo"
     mkdir -p "$source_dir"
-    log "Downloading MongoDB $version source for $suite/$arch"
-    curl -fsSL --retry 3 \
-        "https://github.com/mongodb/mongo/archive/refs/tags/r${version}.tar.gz" \
-        -o "$WORK_DIR/mongo.tar.gz"
-    tar -xzf "$WORK_DIR/mongo.tar.gz" --strip-components=1 -C "$source_dir"
+    local source_tarball="$SOURCE_CACHE_DIR/r${version}.tar.gz"
+    mkdir -p "$SOURCE_CACHE_DIR"
+    if [[ -s "$source_tarball" ]] && tar -tzf "$source_tarball" >/dev/null 2>&1; then
+        log "Reusing cached MongoDB $version source archive: $source_tarball"
+    else
+        log "Downloading MongoDB $version source for $suite/$arch"
+        CACHE_TMP="$(mktemp "$SOURCE_CACHE_DIR/.r${version}.XXXXXX")"
+        curl -fsSL --retry 3 \
+            "https://github.com/mongodb/mongo/archive/refs/tags/r${version}.tar.gz" \
+            -o "$CACHE_TMP"
+        tar -tzf "$CACHE_TMP" >/dev/null
+        mv -f -- "$CACHE_TMP" "$source_tarball"
+        CACHE_TMP=""
+    fi
+    tar -xzf "$source_tarball" --strip-components=1 -C "$source_dir"
 
     log "Installing MongoDB Python build requirements"
     python3 -m venv "$WORK_DIR/venv"
