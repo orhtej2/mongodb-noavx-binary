@@ -119,6 +119,39 @@ prepare_mongo_bazel_toolchain() {
     esac
 }
 
+multiarch_triplet() {
+    case "$1" in
+        amd64) printf 'x86_64-linux-gnu\n' ;;
+        arm64) printf 'aarch64-linux-gnu\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+apply_bazel_builtin_include_dirs() {
+    local flags_file="$1"
+    local triplet
+    local marker='"/usr/include/openssl",'
+    local extra_dir
+    local extra_cross_dir
+
+    triplet="$(multiarch_triplet "$2")" || return 1
+    extra_dir="/usr/include/$triplet"
+    extra_cross_dir="/usr/$triplet/include"
+
+    if grep -Fq "\"$extra_dir\"," "$flags_file"; then
+        return
+    fi
+    if [[ "$(grep -Fc -- "$marker" "$flags_file")" -ne 1 ]]; then
+        echo "Expected one COMMON_BUILTIN_INCLUDE_DIRECTORIES marker in $flags_file; refusing an unverified patch" >&2
+        return 1
+    fi
+    # MongoDB's hermetic toolchain only declares its own "{arch}-mongodb-linux" include
+    # dir as builtin; add the host's real multiarch dirs so Bazel accepts absolute-path
+    # system/kernel headers (e.g. asm/*.h, limits.h) resolved from there.
+    sed -i "s#$marker#$marker\n    \"$extra_dir\",\n    \"$extra_cross_dir\",#" "$flags_file"
+    grep -Fq "\"$extra_dir\"," "$flags_file"
+}
+
 build_one() {
     local version="$1"
     local suite="$2"
@@ -207,6 +240,14 @@ build_one() {
             log "Applying generic x86-64 Bazel toolchain target"
             apply_bazel_no_avx "$source_dir/bazel/toolchains/cc/mongo_linux/mongo_linux_cc_toolchain_config.bzl"
         fi
+        if [[ "$use_mongo_hermetic_toolchain" == true ]]; then
+            local toolchain_flags_file
+            toolchain_flags_file="$(find "$source_dir/bazel/toolchains/cc/mongo_linux" -maxdepth 1 -type f -name 'mongo_toolchain_flags_v*.bzl' -print -quit)"
+            if [[ -n "$toolchain_flags_file" ]]; then
+                log "Registering host multiarch include directory with MongoDB's hermetic toolchain"
+                apply_bazel_builtin_include_dirs "$toolchain_flags_file" "$arch"
+            fi
+        fi
         bazel_path="$HOME/.local/bin/bazel"
         if [[ ! -x "$bazel_path" ]]; then
             bazel_path="$(command -v bazel || true)"
@@ -229,7 +270,12 @@ build_one() {
             log "No MongoDB hermetic toolchain for this distro; using the native compiler"
             bazel_env+=(USE_NATIVE_TOOLCHAIN=1)
             bazel_flags+=(--repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=0
-                --copt=-D_GNU_SOURCE --cxxopt=-D_GNU_SOURCE)
+                --copt=-D_GNU_SOURCE --cxxopt=-D_GNU_SOURCE
+                # GCC resolves multiarch system header symlinks (e.g. /usr/x86_64-linux-gnu/include)
+                # in .d dependency output; clang (used by MongoDB's hermetic toolchain) rejects
+                # this flag, so it's only safe to pass when falling back to the native GCC.
+                --copt=-fno-canonical-system-headers --cxxopt=-fno-canonical-system-headers
+                --host_copt=-fno-canonical-system-headers --host_cxxopt=-fno-canonical-system-headers)
             if [[ "$arch" == "amd64" ]]; then
                 bazel_flags+=(--copt=-march=x86-64-v2 --cxxopt=-march=x86-64-v2
                     --copt=-mtune=generic --cxxopt=-mtune=generic
