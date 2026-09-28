@@ -7,15 +7,20 @@ SUITES=(bookworm trixie)
 ARCHITECTURES=(amd64 arm64)
 BUILD_JOBS="${BUILD_JOBS:-2}"
 WORK_DIR=""
+WORK_DIR_IS_TEMP=false
 CACHE_TMP=""
 SOURCE_CACHE_DIR="${MONGODB_SOURCE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/mongodb-baseline/sources}"
+# When set, reuse this directory across runs instead of a fresh mktemp workspace,
+# so a failed build can be fixed and re-run incrementally (cached tarball extraction,
+# venv, and Bazel/SCons build outputs) instead of starting from scratch.
+REUSE_WORK_DIR="${MONGODB_BUILD_WORKDIR:-}"
 export CI=1
 export DEBIAN_FRONTEND=noninteractive
 export GIT_TERMINAL_PROMPT=0
 export PIP_NO_INPUT=1
 
 cleanup() {
-    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" && "$WORK_DIR_IS_TEMP" == true ]]; then
         rm -rf -- "$WORK_DIR"
     fi
     if [[ -n "$CACHE_TMP" && -f "$CACHE_TMP" ]]; then
@@ -185,9 +190,16 @@ build_one() {
         command -v "$tool" >/dev/null || { echo "Missing build prerequisite: $tool (run install-deps)" >&2; exit 1; }
     done
 
-    WORK_DIR="$(mktemp -d)"
+    if [[ -n "$REUSE_WORK_DIR" ]]; then
+        WORK_DIR="$REUSE_WORK_DIR"
+        WORK_DIR_IS_TEMP=false
+        mkdir -p "$WORK_DIR"
+        log "Reusing workspace directory: $WORK_DIR"
+    else
+        WORK_DIR="$(mktemp -d)"
+        WORK_DIR_IS_TEMP=true
+    fi
     source_dir="$WORK_DIR/mongo"
-    mkdir -p "$source_dir"
     local source_tarball="$SOURCE_CACHE_DIR/r${version}.tar.gz"
     mkdir -p "$SOURCE_CACHE_DIR"
     if [[ -s "$source_tarball" ]] && tar -tzf "$source_tarball" >/dev/null 2>&1; then
@@ -202,16 +214,39 @@ build_one() {
         mv -f -- "$CACHE_TMP" "$source_tarball"
         CACHE_TMP=""
     fi
-    tar -xzf "$source_tarball" --strip-components=1 -C "$source_dir"
-
-    log "Installing MongoDB Python build requirements"
-    python3 -m venv "$WORK_DIR/venv"
-    if [[ -f "$source_dir/etc/pip/compile-requirements.txt" ]]; then
-        "$WORK_DIR/venv/bin/pip" install --no-input --disable-pip-version-check --upgrade pip
-        "$WORK_DIR/venv/bin/pip" install --no-input --disable-pip-version-check requirements_parser
-        "$WORK_DIR/venv/bin/pip" install --no-input --disable-pip-version-check -r "$source_dir/etc/pip/compile-requirements.txt"
+    if [[ -d "$source_dir/debian" ]]; then
+        log "Reusing already-extracted MongoDB $version source in $source_dir"
     else
-        log "No legacy SCons requirements file in this tag; continuing with its Bazel setup"
+        mkdir -p "$source_dir"
+        tar -xzf "$source_tarball" --strip-components=1 -C "$source_dir"
+    fi
+
+    if [[ "$major" != "7" ]]; then
+        # MongoDB's Bazel wrapper hook derives $(MONGO_VERSION) from `git describe --abbrev=0`;
+        # a tarball checkout has no tags, which crashes the releases.h template generator.
+        if (cd "$source_dir" && git rev-parse -q --verify "refs/tags/r$version" >/dev/null 2>&1); then
+            log "Source already tagged r$version; skipping git init"
+        else
+            (cd "$source_dir" && git init -q \
+                && git config user.email "mongodb-baseline@example.invalid" \
+                && git config user.name "MongoDB Baseline Builds" \
+                && git commit -q --allow-empty -m "MongoDB $version" \
+                && git tag -a "r$version" -m "MongoDB $version")
+        fi
+    fi
+
+    if [[ -x "$WORK_DIR/venv/bin/python" ]]; then
+        log "Reusing existing Python venv: $WORK_DIR/venv"
+    else
+        log "Installing MongoDB Python build requirements"
+        python3 -m venv "$WORK_DIR/venv"
+        if [[ -f "$source_dir/etc/pip/compile-requirements.txt" ]]; then
+            "$WORK_DIR/venv/bin/pip" install --no-input --disable-pip-version-check --upgrade pip
+            "$WORK_DIR/venv/bin/pip" install --no-input --disable-pip-version-check requirements_parser
+            "$WORK_DIR/venv/bin/pip" install --no-input --disable-pip-version-check -r "$source_dir/etc/pip/compile-requirements.txt"
+        else
+            log "No legacy SCons requirements file in this tag; continuing with its Bazel setup"
+        fi
     fi
 
     if [[ "$major" == "7" ]]; then
@@ -300,6 +335,19 @@ build_one() {
     cp "$source_dir/debian/mongodb-org.control" "$source_dir/debian/control"
     cp "$source_dir/debian/mongodb-org.rules" "$source_dir/debian/rules"
     chmod 0755 "$source_dir/debian/rules"
+    # mongodb-org.rules installs debian/substvars verbatim as each binary package's substvars,
+    # but that file isn't shipped in the public source tarball (only MongoDB's internal build
+    # generates it); an empty file satisfies dpkg-gencontrol with no extra substitutions.
+    : > "$source_dir/debian/substvars"
+    # debian/*.docs files reference LICENSE-Community.txt, README, THIRD-PARTY-NOTICES, and MPL-2
+    # at the source root, but the tarball only ships them under distsrc/ (and README as README.md);
+    # MongoDB's internal build copies distsrc/* into place before packaging, so do the same here.
+    if [[ -d "$source_dir/distsrc" ]]; then
+        cp -n "$source_dir/distsrc/"* "$source_dir/"
+    fi
+    if [[ ! -e "$source_dir/README" && -e "$source_dir/README.md" ]]; then
+        cp "$source_dir/README.md" "$source_dir/README"
+    fi
     printf 'mongodb-org (%s-1~%s) %s; urgency=medium\n\n  * Build MongoDB %s for Debian %s.\n\n -- MongoDB Baseline Builds <mongodb-baseline@example.invalid>  %s\n' \
         "$version" "$suite" "$suite" "$version" "$suite" "$(date -R)" \
         > "$source_dir/debian/changelog"
