@@ -14,6 +14,8 @@ SOURCE_CACHE_DIR="${MONGODB_SOURCE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/mongod
 # so a failed build can be fixed and re-run incrementally (cached tarball extraction,
 # venv, and Bazel/SCons build outputs) instead of starting from scratch.
 REUSE_WORK_DIR="${MONGODB_BUILD_WORKDIR:-}"
+# Set by the inner re-exec inside a per-suite podman container; on the host, empty/0.
+IN_CONTAINER="${MONGODB_IN_CONTAINER:-0}"
 export CI=1
 export DEBIAN_FRONTEND=noninteractive
 export GIT_TERMINAL_PROMPT=0
@@ -79,6 +81,10 @@ install_deps() {
         build-essential ca-certificates curl dpkg-dev fakeroot git lld \
         libncurses6 patch pkg-config debhelper libcurl4-openssl-dev liblzma-dev libssl-dev \
         libzstd-dev python3 python3-dev python3-pip python3-venv qemu-user
+    # Bookworm's default "clang" package is clang-14, which is too old for MongoDB's own
+    # code (e.g. lacks support for [[clang::annotate]] attributes on concept declarations);
+    # prefer clang-19 (matching MongoDB's own hermetic toolchain version) when available.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y clang-19 || DEBIAN_FRONTEND=noninteractive apt-get install -y clang
 }
 
 apply_bazel_no_avx() {
@@ -97,64 +103,47 @@ apply_bazel_no_avx() {
     grep -Fq -- "$replacement" "$config"
 }
 
-prepare_mongo_bazel_toolchain() {
-    local source_dir="$1"
-    local distro_utils="$source_dir/bazel/utils.bzl"
-    local distro_id
-    local distro_version
-
-    . /etc/os-release
-    distro_id="$ID"
-    distro_version="$VERSION_ID"
-    case "$distro_id:$distro_version" in
-        ubuntu:18.*|ubuntu:20.*|ubuntu:22.*|ubuntu:24.*|debian:10|debian:12) return 0 ;;
-        debian:13)
-            if grep -Fq '"Debian GNU/Linux 13": "ubuntu22"' "$distro_utils"; then
-                return 0
-            fi
-            if ! grep -Fq '"Debian GNU/Linux 12": "debian12",' "$distro_utils"; then
-                echo "Cannot map Debian 13 to MongoDB's supported Ubuntu 22 toolchain in $distro_utils" >&2
-                return 1
-            fi
-            sed -i '/"Debian GNU\/Linux 12": "debian12",/a\        "Debian GNU/Linux 13": "ubuntu22",' "$distro_utils"
-            log "Using MongoDB's Ubuntu 22.04 hermetic toolchain for local Debian 13"
-            return 0
-            ;;
-        *) return 1 ;;
-    esac
-}
-
-multiarch_triplet() {
+container_image_for_suite() {
     case "$1" in
-        amd64) printf 'x86_64-linux-gnu\n' ;;
-        arm64) printf 'aarch64-linux-gnu\n' ;;
-        *) return 1 ;;
+        bookworm) printf 'docker.io/library/debian:bookworm\n' ;;
+        trixie) printf 'docker.io/library/debian:trixie\n' ;;
+        *) echo "No container image mapped for suite: $1" >&2; return 1 ;;
     esac
 }
 
-apply_bazel_builtin_include_dirs() {
-    local flags_file="$1"
-    local triplet
-    local marker='"/usr/include/openssl",'
-    local extra_dir
-    local extra_cross_dir
+# Runs the actual build inside a container image matching $suite, so the compiler,
+# glibc, and libstdc++ we link against are the target suite's own (guaranteeing
+# runtime compatibility) instead of relying on MongoDB's hermetic clang toolchain.
+build_in_container() {
+    local version="$1"
+    local suite="$2"
+    local arch="$3"
+    local image
+    local container_home
+    local workdir
 
-    triplet="$(multiarch_triplet "$2")" || return 1
-    extra_dir="/usr/include/$triplet"
-    extra_cross_dir="/usr/$triplet/include"
+    command -v podman >/dev/null || {
+        echo "podman is required to build $suite/$arch in a matching container (install podman, or set MONGODB_IN_CONTAINER=1 to build directly on this host if it already matches $suite)" >&2
+        exit 1
+    }
+    image="$(container_image_for_suite "$suite")"
+    container_home="${MONGODB_CONTAINER_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/mongodb-baseline/container-home}/$suite-$arch"
+    workdir="${REUSE_WORK_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/mongodb-baseline/workdir/$suite-$arch}"
+    mkdir -p "$container_home" "$SOURCE_CACHE_DIR" "$workdir"
 
-    if grep -Fq "\"$extra_dir\"," "$flags_file"; then
-        return
-    fi
-    if [[ "$(grep -Fc -- "$marker" "$flags_file")" -ne 1 ]]; then
-        echo "Expected one COMMON_BUILTIN_INCLUDE_DIRECTORIES marker in $flags_file; refusing an unverified patch" >&2
-        return 1
-    fi
-    # MongoDB's hermetic toolchain only declares its own "{arch}-mongodb-linux" include
-    # dir as builtin; add the host's real multiarch dirs so Bazel accepts absolute-path
-    # system/kernel headers (e.g. asm/*.h, limits.h) resolved from there.
-    sed -i "s#$marker#$marker\n    \"$extra_dir\",\n    \"$extra_cross_dir\",#" "$flags_file"
-    grep -Fq "\"$extra_dir\"," "$flags_file"
+    log "Building $suite/$arch inside $image (podman); workspace: $workdir"
+    podman run --rm \
+        -e "BUILD_JOBS=$BUILD_JOBS" \
+        -e "MONGODB_SOURCE_CACHE=$SOURCE_CACHE_DIR" \
+        -e "MONGODB_BUILD_WORKDIR=$workdir" \
+        -e "MONGODB_IN_CONTAINER=1" \
+        -v "$ROOT_DIR:$ROOT_DIR" \
+        -v "$SOURCE_CACHE_DIR:$SOURCE_CACHE_DIR" \
+        -v "$workdir:$workdir" \
+        -v "$container_home:/root" \
+        -w "$ROOT_DIR" \
+        "$image" \
+        bash -c "bash scripts/mongodb-debs.sh install-deps && bash scripts/mongodb-debs.sh build '$version' '$suite' '$arch'"
 }
 
 build_one() {
@@ -267,29 +256,45 @@ build_one() {
         log "Installing MongoDB $version Bazel"
         (cd "$source_dir" && "$WORK_DIR/venv/bin/python" buildscripts/install_bazel.py)
         export PATH="$HOME/.local/bin:$PATH"
-        local use_mongo_hermetic_toolchain=false
-        if prepare_mongo_bazel_toolchain "$source_dir"; then
-            use_mongo_hermetic_toolchain=true
-        fi
         if [[ "$arch" == "amd64" ]]; then
             log "Applying generic x86-64 Bazel toolchain target"
             apply_bazel_no_avx "$source_dir/bazel/toolchains/cc/mongo_linux/mongo_linux_cc_toolchain_config.bzl"
-        fi
-        if [[ "$use_mongo_hermetic_toolchain" == true ]]; then
-            local toolchain_flags_file
-            toolchain_flags_file="$(find "$source_dir/bazel/toolchains/cc/mongo_linux" -maxdepth 1 -type f -name 'mongo_toolchain_flags_v*.bzl' -print -quit)"
-            if [[ -n "$toolchain_flags_file" ]]; then
-                log "Registering host multiarch include directory with MongoDB's hermetic toolchain"
-                apply_bazel_builtin_include_dirs "$toolchain_flags_file" "$arch"
-            fi
         fi
         bazel_path="$HOME/.local/bin/bazel"
         if [[ ! -x "$bazel_path" ]]; then
             bazel_path="$(command -v bazel || true)"
         fi
         [[ -n "$bazel_path" ]] || { echo "MongoDB Bazel installer did not provide bazel" >&2; exit 1; }
-        local bazel_env=()
-        local bazel_flags=(--config=opt --jobs="$BUILD_JOBS" --disable_warnings_as_errors=True)
+        # Resolve the actual clang binary name (e.g. clang-16 vs the plain "clang" that
+        # install-deps prefers) so Bazel's cc_configure repo_env fingerprint changes whenever
+        # the underlying compiler does, instead of silently reusing a stale cached toolchain.
+        local cc_bin
+        local cxx_bin
+        cc_bin="$(command -v clang-19 || command -v clang)"
+        cxx_bin="$(command -v clang++-19 || command -v clang++)"
+        [[ -n "$cc_bin" && -n "$cxx_bin" ]] || { echo "No clang compiler found (run install-deps)" >&2; exit 1; }
+        local bazel_env=(USE_NATIVE_TOOLCHAIN=1 "CC=$cc_bin" "CXX=$cxx_bin")
+        local bazel_flags=(--config=opt --jobs="$BUILD_JOBS" --disable_warnings_as_errors=True
+            --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=0
+            # This is what MongoDB itself primarily tests/develops against, so using it (rather
+            # than the platform's GCC) avoids a long tail of per-version GCC/clang C++ source
+            # portability differences that would otherwise need patching for every major version.
+            --//bazel/config:compiler_type=clang
+            # Bazel's autoconfigured local toolchain (used below) doesn't carry MongoDB's own
+            # -std=c++20 default the way its custom toolchain config does.
+            --cxxopt=-std=c++20 --host_cxxopt=-std=c++20
+            --copt=-D_GNU_SOURCE --cxxopt=-D_GNU_SOURCE
+            --copt=-Wno-error --cxxopt=-Wno-error
+            # Debian's clang defaults to libstdc++ (not libc++), which declares sized
+            # operator delete(void*, size_t) unconditionally; clang only calls it when
+            # this flag is on, otherwise falling back to an overload that doesn't exist.
+            --cxxopt=-fsized-deallocation --host_cxxopt=-fsized-deallocation
+            # Bazel's autoconfigured local cc_toolchain doesn't enable the feature that lets
+            # angle-bracket includes of external-repo headers (e.g. <absl/hash/hash.h>) resolve;
+            # MongoDB's own hermetic clang toolchain config enables the equivalent implicitly.
+            --features=external_include_paths
+            # Optional and unneeded for these packages; skip it to reduce build scope.
+            --//bazel/config:build_otel=False)
         local ca_bundle="${SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}"
         if [[ -r "$ca_bundle" ]]; then
             bazel_flags+=(
@@ -301,28 +306,17 @@ build_one() {
                 "--repo_env=AWS_CA_BUNDLE=$ca_bundle"
             )
         fi
-        if [[ "$use_mongo_hermetic_toolchain" == false ]]; then
-            log "No MongoDB hermetic toolchain for this distro; using the native compiler"
-            bazel_env+=(USE_NATIVE_TOOLCHAIN=1)
-            bazel_flags+=(--repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=0
-                --copt=-D_GNU_SOURCE --cxxopt=-D_GNU_SOURCE
-                # GCC resolves multiarch system header symlinks (e.g. /usr/x86_64-linux-gnu/include)
-                # in .d dependency output; clang (used by MongoDB's hermetic toolchain) rejects
-                # this flag, so it's only safe to pass when falling back to the native GCC.
-                --copt=-fno-canonical-system-headers --cxxopt=-fno-canonical-system-headers
-                --host_copt=-fno-canonical-system-headers --host_cxxopt=-fno-canonical-system-headers)
-            if [[ "$arch" == "amd64" ]]; then
-                bazel_flags+=(--copt=-march=x86-64-v2 --cxxopt=-march=x86-64-v2
-                    --copt=-mtune=generic --cxxopt=-mtune=generic
-                    --copt=-mno-avx --cxxopt=-mno-avx
-                    --copt=-mno-avx2 --cxxopt=-mno-avx2
-                    --copt=-mno-fma --cxxopt=-mno-fma)
-            else
-                bazel_flags+=(--copt=-march=armv8-a --cxxopt=-march=armv8-a
-                    --copt=-mtune=generic --cxxopt=-mtune=generic)
-            fi
+        if [[ "$arch" == "amd64" ]]; then
+            bazel_flags+=(--copt=-march=x86-64-v2 --cxxopt=-march=x86-64-v2
+                --copt=-mtune=generic --cxxopt=-mtune=generic
+                --copt=-mno-avx --cxxopt=-mno-avx
+                --copt=-mno-avx2 --cxxopt=-mno-avx2
+                --copt=-mno-fma --cxxopt=-mno-fma)
+        else
+            bazel_flags+=(--copt=-march=armv8-a --cxxopt=-march=armv8-a
+                --copt=-mtune=generic --cxxopt=-mtune=generic)
         fi
-        log "Building MongoDB $version with Bazel"
+        log "Building MongoDB $version with Bazel (native $suite toolchain)"
         (cd "$source_dir" && env "${bazel_env[@]}" "$bazel_path" build \
             "${bazel_flags[@]}" install-dist)
         install -D -m 0755 "$source_dir/bazel-bin/install/bin/mongod" "$source_dir/bin/mongod"
@@ -397,12 +391,26 @@ build() {
     validate_version "$version"
 
     if [[ -n "$suite" ]]; then
-        build_one "$version" "$suite" "$arch" "$arch"
+        dispatch_build "$version" "$suite" "$arch"
         return
     fi
     for item in "${SUITES[@]}"; do
-        build_one "$version" "$item" "$arch" "$arch"
+        dispatch_build "$version" "$item" "$arch"
     done
+}
+
+# Builds happen inside a per-suite container (so the compiler/glibc/libstdc++ match
+# that suite exactly) unless we're already the inner re-exec inside that container.
+dispatch_build() {
+    local version="$1"
+    local suite="$2"
+    local arch="$3"
+
+    if [[ "$IN_CONTAINER" == "1" ]]; then
+        build_one "$version" "$suite" "$arch" "$arch"
+    else
+        build_in_container "$version" "$suite" "$arch"
+    fi
 }
 
 publish() {
